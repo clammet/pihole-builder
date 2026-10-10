@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+config.json
+build/
+dist/
+.cache/
+*.img
+*.raw
+*.xz
+*.oci
