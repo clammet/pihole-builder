@@ -129,7 +129,9 @@ class Appliance:
 
     def inspect(self):
         try:
-            return json.loads(command("podman", "inspect", NAME, timeout=30))[0]
+            # Unqualified `podman inspect` also resolves images. After a pull,
+            # an image named pihole must not be mistaken for the container.
+            return json.loads(command("podman", "container", "inspect", NAME, timeout=30))[0]
         except (RuntimeError, ValueError, IndexError):
             return None
 
@@ -146,7 +148,11 @@ class Appliance:
         command("podman", "rm", "--force", "--ignore", NAME, timeout=90)
         self.data(generation).mkdir(parents=True, exist_ok=True)
         port = str(self.config["pihole"]["web_port"])
-        command("podman", "run", "--detach", "--name", NAME, "--pull=never",
+        # Keep conmon outside the short-lived controller's service cgroup.
+        # Otherwise systemd kills it when a successful oneshot completes.
+        command("systemd-run", "--scope", "--quiet", "--collect", "--slice=machine.slice",
+                "--unit=pihole-container-" + uuid.uuid4().hex,
+                "podman", "run", "--detach", "--name", NAME, "--pull=never",
                 "--restart=always", "--log-driver=journald", "--health-cmd=none",
                 "--env-file", "/etc/pihole-appliance/container.env",
                 "--publish", "53:53/udp", "--publish", "53:53/tcp",

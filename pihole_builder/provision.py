@@ -129,6 +129,11 @@ if [ "${{1-}}" = --prepare ]; then exit 0; fi
 
 # All target architecture commands execute here, on the Pi's first boot.
 zypper --non-interactive install --no-recommends podman python3 health-checker curl
+# transactional-update does not mount persistent subvolumes in its new root.
+# Mount them before writing the archive and health-checker plugin, otherwise
+# those files are hidden by the real subvolume mounts after switch-root.
+mountpoint -q /var || mount /var
+mountpoint -q /usr/local || mount /usr/local
 install -d -m 700 /etc/pihole-appliance /var/lib/pihole-appliance
 install -m 600 payload/config.json payload/container.env /etc/pihole-appliance/
 install -m 644 payload/appliance.py /etc/pihole-appliance/

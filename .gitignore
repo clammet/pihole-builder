@@ -8,3 +8,4 @@ dist/
 *.raw
 *.xz
 *.oci
+docs/armv7-validation.md

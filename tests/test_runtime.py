@@ -17,6 +17,21 @@ class SimulatedPowerLoss(BaseException):
     pass
 
 
+class ContainerInspectionTests(unittest.TestCase):
+    def test_image_named_pihole_is_not_a_running_container(self):
+        def podman(*args, **kwargs):
+            if args == ('podman', 'inspect', 'pihole'):
+                return json.dumps([{'Id': 'image-only', 'RepoTags': ['docker.io/pihole/pihole:latest']}])
+            if args == ('podman', 'container', 'inspect', 'pihole'):
+                raise RuntimeError('no such container')
+            raise AssertionError(f'Unexpected attempt to operate on a missing container: {args}')
+
+        with tempfile.TemporaryDirectory() as d, patch.object(runtime, 'command', side_effect=podman):
+            app = runtime.Appliance({}, Path(d))
+            self.assertIsNone(app.inspect())
+            app.stop()
+
+
 class FakeAppliance(runtime.Appliance):
     def __init__(self, config, root):
         super().__init__(config, root)

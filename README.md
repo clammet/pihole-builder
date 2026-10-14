@@ -2,13 +2,13 @@
 
 Build a flashable Raspberry Pi SD image containing openSUSE MicroOS, a Pi-hole container matching the target architecture, and an unattended Podman update/recovery controller. Configuration comes from JSON and/or command-line overrides. The default follows Pi-hole's `latest` release and updates MicroOS daily.
 
-**Status:** implementation and local unit tests are complete. Full image assembly, first boot, and recovery on physical Raspberry Pi hardware still need validation. Do not treat this repository as a hardware-tested appliance release.
+**Status:** full ARMv7 image assembly, all 26 Linux tests (including real disk integration tests), and unattended MicroOS first boot, reboot persistence, DNS/web administration, update checks, and database rollback pass in ARM emulation with SELinux enforcing. Boot and recovery on physical Raspberry Pi hardware still need validation. See the [ARMv7 validation record](docs/armv7-validation.md) for the exact scope and results. Do not treat this repository as a hardware-tested appliance release.
 
 ## Hardware scope
 
 | Board | Builder target | Status |
 | --- | --- | --- |
-| Pi 2B (all revisions, including original / 1.1) | `pi2` | ARMv7 MicroOS RaspberryPi2 base and `linux/arm/v7` container; download availability caveat below |
+| Pi 2B (all revisions, including original / 1.1) | `pi2` | ARMv7 image assembly and container/controller checks validated; physical hardware validation pending |
 | Pi 2B revisions 1.2 / 1.3, optional 64-bit build | `pi2-64` | 64-bit CPU; requires an explicitly supplied, board-validated MicroOS base |
 | Pi 3 family | `pi3` | Uses upstream Raspberry Pi image; hardware validation pending |
 | Pi 4 / 400 | `pi4` / `pi400` | Uses upstream Raspberry Pi image; hardware validation pending |
@@ -16,7 +16,7 @@ Build a flashable Raspberry Pi SD image containing openSUSE MicroOS, a Pi-hole c
 
 MicroOS has a 32-bit ARMv7 RaspberryPi2 image: `armv7l` is 32-bit, and the download repository uses the name `armv7hl`. Select `pi2` for this image, including on the original 2B. Other targets select ARM64. These are separate board/architecture builds, not one universal SD image. Compute Modules and other variants require separate boot validation.
 
-**ARMv7 download availability (checked 2026-10-08):** the official MicroOS download page advertises `openSUSE-MicroOS.armv7l-RaspberryPi2.raw.xz`, but its linked image and checksum currently return HTTP 404. The builder selects that official URL for `pi2`; until it works again, supply a trusted ARMv7 MicroOS RaspberryPi2 image using `--base-image` and `--base-sha256`, or a verified alternative `--base-url`. This is a download availability issue, not a 64-bit CPU requirement. ARMv7 first boot and package installation remain unverified. The ARMv7 base is not labeled ContainerHost; provisioning explicitly installs Podman.
+**ARMv7 download availability (checked 2026-10-13):** the official `openSUSE-MicroOS.armv7l-RaspberryPi2.raw.xz` image and checksum URLs work again. The full download was verified and MicroOS snapshot 20261011 was successfully assembled for `pi2`. Signed ARMv7 package installation and unattended MicroOS first boot were validated in emulation. The ARMv7 base is not labeled ContainerHost; provisioning explicitly installs Podman.
 
 Use wired Ethernet, a reliable power supply and a high-endurance **16 GB or larger SD card**. The default image is 12 GiB. Root storage is expanded during the build; the final seed partition deliberately caps it at that size. A larger card's extra space is unused unless you increase `image_size_mib` before building. The builder never writes to an SD card or any user-supplied block device.
 
