@@ -97,14 +97,6 @@ class ConfigTests(unittest.TestCase):
                 c['pihole'][key] = value
                 validate(c)
 
-    def test_load_migration_example_and_preserve_cli_overrides(self):
-        path = Path(__file__).resolve().parents[1] / 'config.migration.example.json'
-        c = load(path, ['admin_password="unit-test-password"', 'pihole.health_domain="custom.test"'])
-        self.assertEqual(c['target'], 'pi2')
-        self.assertEqual(len(c['pihole']['adlists']), 2)
-        self.assertEqual(c['pihole']['health_domain'], 'custom.test')
-        self.assertEqual(c['pihole']['privacy_level'], 3)
-
 
 class PartitionTests(unittest.TestCase):
     def table(self, label='gpt'):

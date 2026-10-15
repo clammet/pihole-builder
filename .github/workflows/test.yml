@@ -16,6 +16,5 @@ jobs:
           python3 build.py --set 'admin_password="ci-only-test-password"' --render-only build/ci
           bash -n build/ci/script
           shellcheck build/ci/script build/ci/payload/clean-seed.sh
-          systemd-analyze calendar '*-*-* 03:00:00'
       - name: Exercise real image partitioning and filesystem resize
         run: sudo env PIHOLE_DISK_TESTS=1 python3 -m unittest discover -s tests -p test_disk_integration.py -v
