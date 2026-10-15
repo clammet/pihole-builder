@@ -76,10 +76,16 @@ dns-priority=-100
     environment = {
         "TZ": config["timezone"], "FTLCONF_webserver_api_password": config["admin_password"],
         "FTLCONF_dns_listeningMode": "ALL", "FTLCONF_dns_upstreams": ";".join(p["upstream_dns"]),
-        "FTLCONF_dns_hosts": "192.0.2.1 appliance-health.test",
+        "FTLCONF_dns_hosts": ";".join([f"192.0.2.1 {p['health_domain']}"] + p["local_records"]),
         "FTLCONF_webserver_port": "80", "FTLCONF_ntp_ipv4_active": "false",
         "FTLCONF_ntp_ipv6_active": "false", "FTLCONF_ntp_sync_active": "false",
-        "FTLCONF_database_maxDBdays": "7",
+        "FTLCONF_database_maxDBdays": str(p["database_days"]),
+        "FTLCONF_dns_dnssec": str(p["dnssec"]).lower(),
+        "FTLCONF_dns_domainNeeded": str(p["domain_needed"]).lower(),
+        "FTLCONF_dns_queryLogging": str(p["query_logging"]).lower(),
+        "FTLCONF_dns_cache_optimizer": str(p["cache_optimizer"]),
+        "FTLCONF_misc_privacylevel": str(p["privacy_level"]),
+        "FTLCONF_webserver_session_timeout": str(p["web_session_timeout"]),
     }
     write(payload, "container.env", "".join(f"{k}={v}\n" for k, v in environment.items()))
     shutil.copyfile(RUNTIME, payload / "appliance.py")

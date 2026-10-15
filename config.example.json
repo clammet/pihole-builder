@@ -13,7 +13,18 @@
   "pihole": {
     "image": "docker.io/pihole/pihole:latest",
     "upstream_dns": ["1.1.1.1", "9.9.9.9"],
-    "web_port": 80
+    "web_port": 80,
+    "dnssec": false,
+    "domain_needed": false,
+    "query_logging": true,
+    "privacy_level": 0,
+    "cache_optimizer": 3600,
+    "database_days": 7,
+    "web_session_timeout": 1800,
+    "web_headers": null,
+    "adlists": null,
+    "health_domain": "appliance-health.test",
+    "local_records": []
   },
   "updates": {
     "container_calendar": "*-*-* 03:00:00",

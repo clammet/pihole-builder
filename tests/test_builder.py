@@ -56,6 +56,55 @@ class ConfigTests(unittest.TestCase):
             self.assertNotIn(c['admin_password'], (root / 'script').read_text())
             self.assertEqual((root / 'payload/config.json').stat().st_mode & 0o777, 0o600)
 
+    def test_migration_settings_and_local_records_reach_ftl(self):
+        c = config()
+        c['pihole'].update(dnssec=True, domain_needed=True, query_logging=False,
+                           privacy_level=3, cache_optimizer=30, database_days=91,
+                           web_session_timeout=2592000, health_domain='resolver-health.test',
+                           local_records=['192.168.1.20 printer.test printer', '2001:db8::1 ipv6.test'])
+        validate(c)
+        with tempfile.TemporaryDirectory() as d:
+            render(c, d)
+            env = dict(line.split('=', 1) for line in (Path(d) / 'payload/container.env').read_text().splitlines())
+        self.assertEqual(env['FTLCONF_dns_hosts'].split(';'),
+                         ['192.0.2.1 resolver-health.test'] + c['pihole']['local_records'])
+        self.assertEqual(env['FTLCONF_dns_dnssec'], 'true')
+        self.assertEqual(env['FTLCONF_dns_domainNeeded'], 'true')
+        self.assertEqual(env['FTLCONF_dns_queryLogging'], 'false')
+        self.assertEqual(env['FTLCONF_misc_privacylevel'], '3')
+        self.assertEqual(env['FTLCONF_dns_cache_optimizer'], '30')
+        self.assertEqual(env['FTLCONF_database_maxDBdays'], '91')
+        self.assertEqual(env['FTLCONF_webserver_session_timeout'], '2592000')
+        self.assertEqual(env['FTLCONF_dns_listeningMode'], 'ALL')
+
+    def test_reject_malformed_migration_settings_and_canary_conflicts(self):
+        changes = [('dnssec', 'true'), ('privacy_level', True), ('cache_optimizer', -2),
+                   ('database_days', -1), ('web_session_timeout', 0),
+                   ('health_domain', 'public.example'), ('health_domain', 'x..test'),
+                   ('local_records', ['192.168.1.2 APPLIANCE-HEALTH.test']),
+                   ('local_records', ['192.168.1.2 example.test', '192.168.1.3 Example.test']),
+                   ('local_records', ['invalid example.test']),
+                   ('local_records', ['192.168.1.2 example.test;malicious.test']),
+                   ('web_headers', ['Bad\nHeader: value']),
+                   ('adlists', ['file:list.txt']),
+                   ('adlists', ['https://user:password@example.org/list']),
+                   ('adlists', ['https://example.org/"list']),
+                   ('adlists', ['https://example.org:bad/list']),
+                   ('adlists', ['https://example.org/list', 'https://example.org/list'])]
+        for key, value in changes:
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                c = config()
+                c['pihole'][key] = value
+                validate(c)
+
+    def test_load_migration_example_and_preserve_cli_overrides(self):
+        path = Path(__file__).resolve().parents[1] / 'config.migration.example.json'
+        c = load(path, ['admin_password="unit-test-password"', 'pihole.health_domain="custom.test"'])
+        self.assertEqual(c['target'], 'pi2')
+        self.assertEqual(len(c['pihole']['adlists']), 2)
+        self.assertEqual(c['pihole']['health_domain'], 'custom.test')
+        self.assertEqual(c['pihole']['privacy_level'], 3)
+
 
 class PartitionTests(unittest.TestCase):
     def table(self, label='gpt'):

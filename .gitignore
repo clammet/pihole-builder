@@ -9,3 +9,4 @@ dist/
 *.xz
 *.oci
 docs/armv7-validation.md
+docs/current-setup-audit.md

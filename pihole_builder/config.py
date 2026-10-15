@@ -4,6 +4,7 @@ import ipaddress
 import json
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .targets import TARGETS
@@ -14,7 +15,12 @@ DEFAULTS = {
     "network": {"interface": "eth0", "address": None, "gateway": None,
                 "host_dns": ["1.1.1.1", "9.9.9.9"]},
     "pihole": {"image": "docker.io/pihole/pihole:latest",
-               "upstream_dns": ["1.1.1.1", "9.9.9.9"], "web_port": 80},
+               "upstream_dns": ["1.1.1.1", "9.9.9.9"], "web_port": 80,
+               "dnssec": False, "domain_needed": False, "query_logging": True,
+               "privacy_level": 0, "cache_optimizer": 3600,
+               "database_days": 7, "web_session_timeout": 1800,
+               "web_headers": None, "local_records": [], "adlists": None,
+               "health_domain": "appliance-health.test"},
     "updates": {"container_calendar": "*-*-* 03:00:00", "os_calendar": "*-*-* 04:00:00",
                 "random_delay_seconds": 600, "health_timeout_seconds": 180,
                 "health_successes": 3, "retry_failed_after_hours": 24},
@@ -43,6 +49,14 @@ def line(value, name):
 def integer(value, name, low, high):
     if type(value) is not int or not low <= value <= high:
         raise ValueError(f"{name} must be an integer from {low} to {high}")
+
+
+def domain(value, name):
+    value = line(value, name)
+    if len(value) > 253 or not all(re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label)
+                                  for label in value.split(".")):
+        raise ValueError(f"{name} must be a DNS hostname without a trailing dot")
+    return value.lower()
 
 
 def validate(c):
@@ -91,6 +105,53 @@ def validate(c):
     integer(c["pihole"]["web_port"], "web_port", 1, 65535)
     if c["pihole"]["web_port"] in (22, 53):
         raise ValueError("web_port conflicts with SSH/DNS")
+    p = c["pihole"]
+    for key in ("dnssec", "domain_needed", "query_logging"):
+        if type(p[key]) is not bool:
+            raise ValueError(f"pihole.{key} must be a boolean")
+    integer(p["privacy_level"], "pihole.privacy_level", 0, 3)
+    integer(p["cache_optimizer"], "pihole.cache_optimizer", -1, 86400)
+    integer(p["database_days"], "pihole.database_days", 0, 36500)
+    integer(p["web_session_timeout"], "pihole.web_session_timeout", 1, 31536000)
+    health_domain = domain(p["health_domain"], "pihole.health_domain")
+    if not health_domain.endswith(".test"):
+        raise ValueError("pihole.health_domain must be under the reserved .test domain")
+    if not isinstance(p["local_records"], list):
+        raise ValueError("pihole.local_records must be an array of IP HOSTNAME [HOSTNAME ...] strings")
+    names = {health_domain}
+    for record in p["local_records"]:
+        parts = line(record, "local record").split()
+        if len(parts) < 2:
+            raise ValueError("Local records require an IP address and at least one hostname")
+        ipaddress.ip_address(parts[0])
+        for hostname in parts[1:]:
+            hostname = domain(hostname, "local record hostname")
+            if hostname in names:
+                raise ValueError("Duplicate local hostname or conflict with the health domain")
+            names.add(hostname)
+    if p["web_headers"] is not None:
+        if not isinstance(p["web_headers"], list) or not p["web_headers"]:
+            raise ValueError("pihole.web_headers must be null or a nonempty header array")
+        for header in p["web_headers"]:
+            if not re.fullmatch(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+: .+", line(header, "web header")):
+                raise ValueError("Headers require 'Name: value'")
+    if p["adlists"] is not None:
+        if not isinstance(p["adlists"], list):
+            raise ValueError("pihole.adlists must be null or an array of HTTP(S) URLs")
+        seen = set()
+        for address in p["adlists"]:
+            parsed = urlsplit(line(address, "adlist URL"))
+            if (parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username is not None
+                    or parsed.password is not None or parsed.fragment or any(ch.isspace() for ch in address)
+                    or any(ch in address for ch in ('"', "\\", ";"))):
+                raise ValueError("Adlists require HTTP(S) URLs without credentials, fragments, quotes, escapes, or semicolons")
+            try:
+                parsed.port
+            except ValueError as error:
+                raise ValueError("Invalid adlist URL port") from error
+            if address in seen:
+                raise ValueError("Duplicate adlist URL")
+            seen.add(address)
     u = c["updates"]
     for key in ("container_calendar", "os_calendar"):
         if u[key] is not None:

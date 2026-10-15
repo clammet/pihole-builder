@@ -59,7 +59,38 @@ sudo python3 build.py --config config.json \
   --output dist/pihole-pi3.img
 ```
 
-For macOS/Windows, use a Linux VM for the full build. You can validate config and inspect generated provisioning locally without root, downloads or disk operations:
+### Building from macOS
+
+Install [Lima](https://lima-vm.io/) with `brew install lima` if it is not already installed. Prepare `config.json` as described above, then run this from the checkout as your normal macOS user:
+
+```sh
+python3 build-macos.py
+```
+
+Each invocation creates a temporary Ubuntu 26.04 VM with a unique `pihole-build-…` name, using Apple's native virtualization backend (`vz`). Apple Silicon uses an ARM64 guest; Intel Macs use an x86-64 guest. No Raspberry Pi CPU emulation is needed for image assembly. Lima 2.0+ and macOS 13.5+ are recommended.
+
+Lima caches the Ubuntu download; Linux build dependencies are installed in the fresh VM on each run. Defaults are four CPUs, 4 GiB RAM and a 60 GiB virtual disk; change these with `--cpus`, `--memory` and `--disk`. Allow approximately 20–30 GB of working space in the VM plus room on the Mac for the final image and Ubuntu VM disk.
+
+The wrapper copies the builder and configuration into a private directory on the VM's own disk, builds there, verifies the transferred image's SHA-256, and saves the image, checksum and manifest to `dist/`. It does not mount the Mac's directories. Existing output files are never replaced. After success, failure or Ctrl-C, the temporary VM and its disk are deleted. Deletion is not secure erasure. The finished output files and Lima's shared download cache remain; no build container or reusable VM is retained. Forced termination, a host crash or a failed Lima deletion can leave a VM behind; its name is printed in the build log, and a deletion failure makes the command fail.
+
+Configuration overrides and pinned base images work like the Linux builder:
+
+```sh
+python3 build-macos.py --set 'target="pi2"' --output dist/pihole-pi2.img
+python3 build-macos.py --base-image downloads/microos.raw.xz --base-sha256 '<trusted-64-character-sha256>'
+```
+
+To check the VM and its real partitioning/Btrfs operations without downloading MicroOS or building a full image:
+
+```sh
+python3 build-macos.py --check-vm
+```
+
+Use `--vm-name NAME` to choose the temporary VM's name; an existing name is refused to protect other VMs. If a host crash leaves a build VM behind, remove that specific VM with `limactl delete --force NAME` when no build is running. Images already copied to `dist/` remain available for flashing with Raspberry Pi Imager on macOS.
+
+### Previewing without Linux
+
+For Windows, use a Linux VM for the full build. On macOS/Windows you can validate config and inspect generated provisioning locally without root, downloads or disk operations:
 
 ```sh
 python3 build.py --config config.json --render-only build/preview
@@ -97,6 +128,15 @@ The checksum is for the supplied input, compressed if it is `.xz`. If the upstre
 | `pihole.image` | Fully qualified registry reference; default `docker.io/pihole/pihole:latest` |
 | `pihole.upstream_dns` | Upstream DNS server IP addresses for Pi-hole |
 | `pihole.web_port` | Host HTTP port; default 80 |
+| `pihole.dnssec`, `pihole.domain_needed` | Validate DNSSEC and prevent forwarding single-label names; both default false |
+| `pihole.query_logging`, `pihole.privacy_level` | Text query logging (default true) and FTL privacy level 0–3 (default 0) |
+| `pihole.cache_optimizer` | Maximum stale-cache age in seconds; default 3600, `-1` disables, `0` permits unlimited stale age |
+| `pihole.database_days` | Query database retention in days; default 7; privacy level 3 disables long-term query logging |
+| `pihole.web_session_timeout` | Web session timeout in seconds; default 1800 |
+| `pihole.web_headers` | Initial HTTP response header array, or `null` for upstream defaults; seeded once, then editable in the UI |
+| `pihole.adlists` | Initial enabled blocklist URLs in the default group; `null` uses the container default, `[]` starts without lists; seeded once |
+| `pihole.local_records` | Authoritative local records in `IP HOSTNAME [HOSTNAME ...]` format; default empty |
+| `pihole.health_domain` | Local probe hostname under reserved `.test`; default `appliance-health.test`, always resolves to `192.0.2.1` |
 | `updates.container_calendar` | systemd calendar for container updates; `null` disables them |
 | `updates.os_calendar` | systemd calendar for OS updates; `null` disables them |
 | `updates.random_delay_seconds` | Maximum schedule jitter, defaults to 600 seconds |
@@ -107,7 +147,31 @@ The checksum is for the supplied input, compressed if it is `.xz`. If the upstre
 
 Schedules use the configured host timezone unless the calendar includes a timezone. Default container checks start at 03:00 and OS updates at 04:00, each with up to ten minutes of jitter. Timers are persistent: a missed run can execute after the next boot. These are start times, not hard maintenance-window end times. OS updates reboot immediately after successful installation, so allow for download/install time. Container and OS maintenance share a lock.
 
-The current network scope is wired IPv4, DNS and HTTP administration. Wi-Fi, IPv6 client provisioning, DHCP-server mode, TLS termination and NTP serving are not configured. Pi-hole settings supplied through environment variables are authoritative; change the appliance configuration to change them. The reserved local record `appliance-health.test` is used for health probes. Query database retention is limited to seven days, and host journal storage is capped.
+The current network scope is wired IPv4, DNS and HTTP administration. Wi-Fi, IPv6 client provisioning, DHCP-server mode, TLS termination and NTP serving are not configured. Pi-hole settings supplied through environment variables are authoritative; change the appliance configuration to change them. The configured local health record is appended to all local records and cannot be overridden by them. Query database retention defaults to seven days, and host journal storage is capped. Blocklists and optional web headers seed a fresh data generation; later upgrades and rollbacks preserve their database/UI changes. Changing these seed settings after deployment requires a UI change or a fresh appliance.
+
+### Migrating the inspected Pi 2 setup
+
+The [inspection report](docs/current-setup-audit.md) records the existing settings, defaults, recommendations and intentional differences. `config.migration.example.json` selects the original Pi 2B's 32-bit target and preserves the existing upstreams, two blocklists, DNSSEC, privacy settings and cache optimizer. It replaces the older security headers with current upstream defaults and uses a 30-minute web session timeout. Set `pihole.web_session_timeout` to `2592000` if you deliberately want the old 30-day timeout.
+
+```sh
+cp config.migration.example.json config.json
+chmod 600 config.json
+# Edit the password and optionally add your SSH public key before rendering.
+python3 build.py --config config.json --render-only build/migration-preview
+# Run the full image build on Linux after reviewing the preview.
+sudo python3 build.py --config config.json --output dist/pihole-migrated.img
+```
+
+Keep or create the router DHCP reservation for the replacement Pi. The migration example uses DHCP, matching the observed running host. Enable SSH by adding a public key; the new appliance's maintenance account is `root`. Configure another reservation/address if testing a second Pi alongside the current one.
+
+Test the replacement directly from a LAN client, replacing `PI_ADDRESS` with its IP:
+
+```sh
+dig @PI_ADDRESS appliance-health.test A +short
+dig @PI_ADDRESS appliance-health.test A +tcp +short
+```
+
+Both must return `192.0.2.1`. This is a DNS answer to inspect; pinging that documentation address does not test the appliance. Use `dig @PI_ADDRESS example.org A` separately to check upstream resolution. The controller requires local DNS over both transports and HTTP administration, so an upstream outage alone does not cause rollback. `pihole.health_domain` can change the local probe name, and the controller uses the same value. The current running Pi has no such record; these commands apply to the newly provisioned appliance.
 
 ## Unattended update and recovery
 

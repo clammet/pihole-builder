@@ -7,7 +7,7 @@ import struct
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from runtime import appliance as runtime
 from pihole_builder.config import DEFAULTS
@@ -30,6 +30,18 @@ class ContainerInspectionTests(unittest.TestCase):
             app = runtime.Appliance({}, Path(d))
             self.assertIsNone(app.inspect())
             app.stop()
+
+    def test_health_checks_use_the_configured_domain_on_both_transports(self):
+        c = copy.deepcopy(DEFAULTS)
+        c['pihole']['health_domain'] = 'custom.test'
+        with tempfile.TemporaryDirectory() as d:
+            app = runtime.Appliance(c, Path(d))
+            with patch.object(app, 'inspect', return_value={'State': {'Running': True}}), \
+                    patch.object(runtime, 'dns_probe', return_value=True) as probe, \
+                    patch.object(runtime.urllib.request, 'build_opener') as opener:
+                opener.return_value.open.return_value.__enter__.return_value.status = 200
+                self.assertTrue(app.healthy())
+                self.assertEqual(probe.call_args_list, [call(domain='custom.test'), call(tcp=True, domain='custom.test')])
 
 
 class FakeAppliance(runtime.Appliance):
@@ -102,6 +114,34 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual((self.app.data(self.old) / 'database').read_text(), 'original-schema')
         self.assertEqual((self.app.data(self.app.state['active']) / 'database').read_text(), 'migrated-schema')
         self.assertIsNone(json.loads(self.app.state_path.read_text())['pending'])
+
+    def test_fresh_deployment_seeds_lists_and_preserves_headers_as_toml(self):
+        self.app.state['active'] = None
+        self.c['pihole']['adlists'] = ['https://example.org/list1', 'https://example.org/list2']
+        headers = ["Content-Security-Policy: default-src 'self'; script-src 'self';", 'X-Frame-Options: DENY']
+        self.c['pihole']['web_headers'] = headers
+        self.app.deploy('first')
+        data = self.app.data(self.app.state['active'])
+        self.assertEqual((data / 'adlists.list').read_text().splitlines(), self.c['pihole']['adlists'])
+        # JSON strings are valid TOML basic strings; semicolons stay in headers.
+        self.assertEqual(json.loads((data / 'pihole.toml').read_text().split(' = ', 1)[1]), headers)
+        (data / 'adlists.list').unlink()  # Pi-hole consumes the initial file.
+        (data / 'pihole.toml').write_text('modified-in-ui')
+        self.app.results = iter([True])
+        self.app.deploy('second')
+        upgraded = self.app.data(self.app.state['active'])
+        self.assertFalse((upgraded / 'adlists.list').exists())
+        self.assertEqual((upgraded / 'pihole.toml').read_text(), 'modified-in-ui')
+
+    def test_default_seed_and_explicit_empty_adlists(self):
+        with tempfile.TemporaryDirectory() as d:
+            directory = Path(d)
+            self.app.seed(directory)
+            self.assertEqual(list(directory.iterdir()), [])
+            self.c['pihole']['adlists'] = []
+            self.app.seed(directory)
+            self.assertTrue((directory / 'adlists.list').exists())
+            self.assertEqual((directory / 'adlists.list').read_text(), '')
 
     def test_failure_restores_image_and_unmigrated_data(self):
         self.app.results = iter([False, True])
@@ -198,3 +238,29 @@ class DnsTests(unittest.TestCase):
             def recv(self, count):
                 return next(self.parts)
         self.assertEqual(runtime.receive(Sock(), 4), b'abcd')
+
+    def test_custom_health_domain_is_sent_over_udp_and_tcp(self):
+        class Sock:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def settimeout(self, seconds): pass
+            def connect(self, address): self.address = address
+            def send(self, packet): self.packet = packet
+            def sendall(self, packet): self.packet = packet[2:]
+            def response(self):
+                ident = struct.unpack('!H', self.packet[:2])[0]
+                answer = b'\xc0\x0c' + struct.pack('!HHIH', 1, 1, 0, 4) + socket.inet_aton(runtime.CANARY_IP)
+                return struct.pack('!6H', ident, 0x8180, 1, 1, 0, 0) + self.packet[12:] + answer
+            def recv(self, size):
+                if not hasattr(self, 'buffer'):
+                    response = self.response()
+                    self.buffer = struct.pack('!H', len(response)) + response if tcp else response
+                data, self.buffer = self.buffer[:size], self.buffer[size:]
+                return data
+        for tcp in (False, True):
+            with self.subTest(tcp=tcp):
+                sock = Sock()
+                with patch.object(runtime.socket, 'socket', return_value=sock):
+                    self.assertTrue(runtime.dns_probe(tcp=tcp, domain='custom.test'))
+                self.assertEqual(sock.packet[12:-4], b'\x06custom\x04test\0')
+                self.assertEqual(sock.address, ('127.0.0.1', 53))

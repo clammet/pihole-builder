@@ -93,9 +93,9 @@ def receive(sock, size):
     return data
 
 
-def dns_probe(tcp=False):
+def dns_probe(tcp=False, domain=CANARY):
     ident = int.from_bytes(os.urandom(2), "big")
-    name = b"".join(bytes([len(p)]) + p.encode() for p in CANARY.split(".")) + b"\0"
+    name = b"".join(bytes([len(p)]) + p.encode() for p in domain.split(".")) + b"\0"
     packet = struct.pack("!6H", ident, 0x100, 1, 0, 0, 0) + name + struct.pack("!HH", 1, 1)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM if tcp else socket.SOCK_DGRAM) as sock:
         sock.settimeout(3)
@@ -164,7 +164,8 @@ class Appliance:
             info = self.inspect()
             if not info or not info["State"]["Running"]:
                 return False
-            if not dns_probe() or not dns_probe(tcp=True):
+            domain = self.config["pihole"].get("health_domain", CANARY)
+            if not dns_probe(domain=domain) or not dns_probe(tcp=True, domain=domain):
                 return False
             url = f"http://127.0.0.1:{self.config['pihole']['web_port']}/admin/"
             # Do not inherit a host's proxy configuration for a loopback check.
@@ -226,6 +227,7 @@ class Appliance:
                 command("cp", "--archive", "--reflink=auto", str(self.data(old)), str(self.data(candidate)))
             else:
                 self.data(candidate).mkdir(mode=0o700)
+                self.seed(self.data(candidate))
             os.sync()
             self.state["pending"] = candidate
             self.save()  # durable BEFORE replacing the container
@@ -242,6 +244,18 @@ class Appliance:
             raise
         self.cleanup()
         print("Committed healthy Pi-hole generation", image, flush=True)
+
+    def seed(self, directory):
+        """Seed only a fresh generation; upgrades retain accepted UI changes."""
+        p = self.config["pihole"]
+        if p.get("adlists") is not None:
+            # Pi-hole's entrypoint imports this into a fresh gravity database.
+            (directory / "adlists.list").write_text("".join(url + "\n" for url in p["adlists"]))
+        if p.get("web_headers") is not None:
+            # FTL splits environment arrays on semicolons, including those in
+            # CSP headers. Seed a TOML array instead to preserve each header.
+            (directory / "pihole.toml").write_text(
+                "[webserver]\nheaders = " + json.dumps(p["web_headers"], ensure_ascii=False) + "\n")
 
     def reconcile(self):
         if self.state["pending"]:
