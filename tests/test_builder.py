@@ -97,6 +97,66 @@ class ConfigTests(unittest.TestCase):
                 c['pihole'][key] = value
                 validate(c)
 
+    def test_sd_card_settings_render_database_and_journal_policy(self):
+        c = config()
+        c['pihole'].update(query_logging=False, database_days=0, ram_logs=True)
+        c['logging'].update(storage='volatile', max_level='crit')
+        validate(c)
+        with tempfile.TemporaryDirectory() as d:
+            render(c, d)
+            payload = Path(d) / 'payload'
+            env = dict(line.split('=', 1) for line in (payload / 'container.env').read_text().splitlines())
+            journal = dict(line.split('=', 1) for line in (payload / 'journald.conf').read_text().splitlines() if '=' in line)
+            script = (Path(d) / 'script').read_text()
+        self.assertEqual(env['FTLCONF_database_maxDBdays'], '0')
+        self.assertEqual(env['FTLCONF_dns_queryLogging'], 'false')
+        self.assertEqual(env['FTLCONF_files_database'], '/dev/shm/pihole-FTL.db')
+        self.assertEqual(env['FTLCONF_database_DBimport'], 'false')
+        self.assertEqual(env['FTLCONF_database_forceDisk'], 'false')
+        self.assertEqual(env['FTLCONF_webserver_session_restore'], 'false')
+        self.assertEqual(env['TAIL_FTL_LOG'], '0')
+        self.assertEqual(journal['Storage'], 'volatile')
+        self.assertEqual(journal['MaxLevelStore'], 'crit')
+        for target in ('Syslog', 'KMsg', 'Console', 'Wall'):
+            self.assertEqual(journal['ForwardTo' + target], 'no')
+        self.assertIn('systemctl mask rsyslog.service syslog-ng.service syslog.service auditd.service', script)
+        self.assertIn('Storage=none', script)
+
+    def test_logging_settings_are_validated(self):
+        for override in ('pihole.ram_logs="true"', 'pihole.ram_data="true"',
+                         'pihole.ram_size_mib=0', 'pihole.ram_size_mib=true', 'logging.storage="disk"',
+                         'logging.max_level="critical"', 'logging.max_level="crit\\nStorage=persistent"'):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                load(overrides=['admin_password="unit-test-password"', override])
+
+    def test_ram_mode_separates_container_storage_from_persistent_images(self):
+        c = config()
+        c['pihole'].update(ram_data=True, ram_size_mib=256)
+        with tempfile.TemporaryDirectory() as d:
+            render(c, d)
+            payload = Path(d) / 'payload'
+            storage = (payload / 'storage.conf').read_text()
+            mount = (payload / 'units/run-pihole.mount').read_text()
+            service = (payload / 'ram-dependencies/pihole-appliance.service.d/ram.conf').read_text()
+            script = (Path(d) / 'script').read_text()
+        self.assertIn('graphroot = "/run/pihole/containers"', storage)
+        self.assertIn('imagestore = "/var/lib/containers/storage"', storage)
+        self.assertIn('size=256M,noswap', mount)
+        self.assertIn('Requires=pihole-ram.service', service)
+        self.assertIn('semanage fcontext -a -e /var/lib/containers/storage /run/pihole/containers', script)
+
+    def test_persistent_logging_profile_preserves_history(self):
+        c = config()
+        c['logging'].update(storage='persistent', max_level='warning')
+        with tempfile.TemporaryDirectory() as d:
+            render(c, d)
+            env = (Path(d) / 'payload/container.env').read_text()
+            script = (Path(d) / 'script').read_text()
+        self.assertNotIn('FTLCONF_files_database=', env)
+        self.assertNotIn('FTLCONF_webserver_session_restore=', env)
+        self.assertNotIn('TAIL_FTL_LOG=', env)
+        self.assertNotIn('systemctl mask rsyslog.service', script)
+
 
 class PartitionTests(unittest.TestCase):
     def table(self, label='gpt'):

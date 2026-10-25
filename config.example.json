@@ -20,11 +20,18 @@
     "privacy_level": 0,
     "cache_optimizer": 3600,
     "database_days": 7,
+    "ram_logs": false,
+    "ram_data": false,
+    "ram_size_mib": 384,
     "web_session_timeout": 1800,
     "web_headers": null,
     "adlists": null,
     "health_domain": "appliance-health.test",
     "local_records": []
+  },
+  "logging": {
+    "storage": "auto",
+    "max_level": "debug"
   },
   "updates": {
     "container_calendar": "*-*-* 03:00:00",

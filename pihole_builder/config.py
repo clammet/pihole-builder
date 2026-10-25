@@ -19,8 +19,10 @@ DEFAULTS = {
                "dnssec": False, "domain_needed": False, "query_logging": True,
                "privacy_level": 0, "cache_optimizer": 3600,
                "database_days": 7, "web_session_timeout": 1800,
+               "ram_logs": False, "ram_data": False, "ram_size_mib": 384,
                "web_headers": None, "local_records": [], "adlists": None,
                "health_domain": "appliance-health.test"},
+    "logging": {"storage": "auto", "max_level": "debug"},
     "updates": {"container_calendar": "*-*-* 03:00:00", "os_calendar": "*-*-* 04:00:00",
                 "random_delay_seconds": 600, "health_timeout_seconds": 180,
                 "health_successes": 3, "retry_failed_after_hours": 24},
@@ -106,12 +108,13 @@ def validate(c):
     if c["pihole"]["web_port"] in (22, 53):
         raise ValueError("web_port conflicts with SSH/DNS")
     p = c["pihole"]
-    for key in ("dnssec", "domain_needed", "query_logging"):
+    for key in ("dnssec", "domain_needed", "query_logging", "ram_logs", "ram_data"):
         if type(p[key]) is not bool:
             raise ValueError(f"pihole.{key} must be a boolean")
     integer(p["privacy_level"], "pihole.privacy_level", 0, 3)
     integer(p["cache_optimizer"], "pihole.cache_optimizer", -1, 86400)
     integer(p["database_days"], "pihole.database_days", 0, 36500)
+    integer(p["ram_size_mib"], "pihole.ram_size_mib", 128, 4096)
     integer(p["web_session_timeout"], "pihole.web_session_timeout", 1, 31536000)
     health_domain = domain(p["health_domain"], "pihole.health_domain")
     if not health_domain.endswith(".test"):
@@ -152,6 +155,10 @@ def validate(c):
             if address in seen:
                 raise ValueError("Duplicate adlist URL")
             seen.add(address)
+    if c["logging"]["storage"] not in ("auto", "persistent", "volatile", "none"):
+        raise ValueError("logging.storage must be auto, persistent, volatile, or none")
+    if c["logging"]["max_level"] not in ("emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"):
+        raise ValueError("logging.max_level must be a syslog severity name")
     u = c["updates"]
     for key in ("container_calendar", "os_calendar"):
         if u[key] is not None:

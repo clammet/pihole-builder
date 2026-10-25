@@ -131,12 +131,17 @@ The checksum is for the supplied input, compressed if it is `.xz`. If the upstre
 | `pihole.dnssec`, `pihole.domain_needed` | Validate DNSSEC and prevent forwarding single-label names; both default false |
 | `pihole.query_logging`, `pihole.privacy_level` | Text query logging (default true) and FTL privacy level 0–3 (default 0) |
 | `pihole.cache_optimizer` | Maximum stale-cache age in seconds; default 3600, `-1` disables, `0` permits unlimited stale age |
-| `pihole.database_days` | Query database retention in days; default 7; privacy level 3 disables long-term query logging |
+| `pihole.database_days` | Query database retention in days; default 7; `0` disables history, redirects the FTL database to shared memory, and disables history import/session restoration; privacy level 3 also disables long-term query logging |
+| `pihole.ram_logs` | Put container logs and temporary files in bounded tmpfs mounts and disable FTL log tailing to container stdout; default false; implied by `ram_data` |
+| `pihole.ram_data` | Run live Pi-hole data, container metadata, and its entire writable container layer in RAM; default false; persist changes explicitly |
+| `pihole.ram_size_mib` | Maximum tmpfs size for live generations and writable container storage; default 384 MiB, range 128–4096; logs/temporary mounts and shared memory have separate limits |
 | `pihole.web_session_timeout` | Web session timeout in seconds; default 1800 |
 | `pihole.web_headers` | Initial HTTP response header array, or `null` for upstream defaults; seeded once, then editable in the UI |
 | `pihole.adlists` | Initial enabled blocklist URLs in the default group; `null` uses the container default, `[]` starts without lists; seeded once |
 | `pihole.local_records` | Authoritative local records in `IP HOSTNAME [HOSTNAME ...]` format; default empty |
 | `pihole.health_domain` | Local probe hostname under reserved `.test`; default `appliance-health.test`, always resolves to `192.0.2.1` |
+| `logging.storage` | Host journal storage: `auto` (default), `persistent`, `volatile` (RAM), or `none`; `volatile`/`none` also mask independent syslog/audit daemons and disable disk core dumps |
+| `logging.max_level` | Highest numeric syslog severity retained: `emerg`, `alert`, `crit`, `err`, `warning`, `notice`, `info`, or `debug` (default); includes all more severe messages |
 | `updates.container_calendar` | systemd calendar for container updates; `null` disables them |
 | `updates.os_calendar` | systemd calendar for OS updates; `null` disables them |
 | `updates.random_delay_seconds` | Maximum schedule jitter, defaults to 600 seconds |
@@ -148,6 +153,58 @@ The checksum is for the supplied input, compressed if it is `.xz`. If the upstre
 Schedules use the configured host timezone unless the calendar includes a timezone. Default container checks start at 03:00 and OS updates at 04:00, each with up to ten minutes of jitter. Timers are persistent: a missed run can execute after the next boot. These are start times, not hard maintenance-window end times. OS updates reboot immediately after successful installation, so allow for download/install time. Container and OS maintenance share a lock.
 
 The current network scope is wired IPv4, DNS and HTTP administration. Wi-Fi, IPv6 client provisioning, DHCP-server mode, TLS termination and NTP serving are not configured. Pi-hole settings supplied through environment variables are authoritative; change the appliance configuration to change them. The configured local health record is appended to all local records and cannot be overridden by them. Query database retention defaults to seven days, and host journal storage is capped. Blocklists and optional web headers seed a fresh data generation; later upgrades and rollbacks preserve their database/UI changes. Changing these seed settings after deployment requires a UI change or a fresh appliance.
+
+### Reducing SD-card writes
+
+For an SD-card deployment, merge these settings into your configuration:
+
+```json
+{
+  "pihole": {
+    "query_logging": false,
+    "database_days": 0,
+    "ram_logs": true,
+    "ram_data": true,
+    "ram_size_mib": 384
+  },
+  "logging": {
+    "storage": "volatile",
+    "max_level": "crit"
+  }
+}
+```
+
+This disables text query logging and long-term query history. The FTL database path is moved to shared memory so ancillary database activity cannot write that database to the card. Login sessions are not restored after an FTL restart. Pi-hole's log files remain available inside the running container, with `/var/log` limited to 16 MiB. `/run`, `/tmp`, and `/var/tmp` use tmpfs limits of 16, 64, and 16 MiB respectively. These are maximum sizes, not preallocated RAM; large blocklists may require increasing the temporary-space limit in the controller.
+
+The host journal retains only critical, alert, and emergency messages, with a 16 MiB RAM limit. Forwarding to syslog, the kernel buffer, console, and wall is disabled. Independent rsyslog, syslog-ng, and auditd services are masked to prevent separate disk logs; SELinux enforcement is unchanged, but persistent audit records are unavailable. Disk core dumps are disabled. Logs disappear on reboot, and warnings and ordinary errors are discarded by the host journal. To retain those errors too, use `"max_level": "err"`.
+
+With `ram_data` enabled, `/run/pihole` is a bounded `noswap` tmpfs. Podman uses it for container metadata and the entire writable container layer, while read-only container images remain on the card in a separate image store. Live `/etc/pihole` data, including gravity, settings, and blocklist refreshes, also lives in RAM. The container's log/temporary/shared-memory mounts use `noswap` as well. This requires a kernel supporting tmpfs `noswap` (Linux 6.4 or newer); startup fails if the RAM storage policy cannot be established. SELinux labels are prepared at boot; enforcement stays enabled. The Podman storage configuration applies to rootful Podman on this dedicated appliance.
+
+Unsaved changes survive container recreation during the same boot. A host reboot or power loss restores the last saved checkpoint, so unsaved UI edits and refreshed blocklists disappear. Initial startup builds gravity in RAM from the configured lists; until you save once, each host boot must rebuild it and needs the list servers to be available. After verifying a new appliance, and whenever you want changes to survive a reboot, run this on the Pi as root:
+
+```sh
+python3 /etc/pihole-appliance/appliance.py persist
+```
+
+Saving briefly interrupts DNS: the controller stops Pi-hole, copies a consistent snapshot to a new on-card generation, restarts it, and accepts the snapshot after DNS/HTTP checks pass. The preceding generation is retained for rollback. Failed or interrupted saves leave the previously accepted checkpoint available. As with an image upgrade, a save rotates the single previous generation; saving after an upgrade replaces the older image's rollback generation with the current image's preceding checkpoint. There is no automatic save on shutdown or before OS updates.
+
+Container upgrades copy live RAM changes into the candidate RAM generation without saving them. The candidate's durable baseline comes from the last saved checkpoint, and migrations run again when that baseline is restored after a host reboot. Rollback restores the preceding generation; after a host reboot it uses that generation's saved data. The controller skips rewriting its state file when recovery bookkeeping has not changed, including routine five-minute healthy checks.
+
+This prevents Pi-hole's live working files from writing to the card; the whole host is **not** disk-write-free. First boot, explicit saves, container-image pulls, controller update/rollback records, filesystem metadata, and other host state can still write to the card. Keep disk-backed swap disabled to avoid swapping host logs or unrelated host memory. For the earlier low-write mode with automatically persistent UI/list changes, set `ram_data` to false; `ram_logs` still moves logs and temporary files to RAM, but its mounts may be swapped if disk-backed swap is configured.
+
+Rebuild and flash a new image to apply these settings; editing the builder configuration does not change an existing image or running appliance. After first boot, inspect the effective policy and container mounts over SSH:
+
+```sh
+systemd-analyze cat-config systemd/journald.conf
+findmnt /run/pihole
+podman info --format '{{.Store.GraphRoot}}'
+podman exec pihole df -h / /etc/pihole /var/log /run /tmp /dev/shm
+swapon --show
+```
+
+The Pi-hole settings follow the upstream [FTL configuration documentation](https://docs.pi-hole.net/ftldns/configfile/); journal storage and severity follow [journald.conf](https://www.freedesktop.org/software/systemd/man/latest/journald.conf.html).
+
+RAM-mode DNS/HTTP, container recreation, upgrade, explicit checkpoint integrity, and checkpoint restoration after a full VM reboot were validated on 2026-10-23 in an ARM64 Ubuntu 26.04 VM with Podman 5.7.0. The RAM storage layout still needs validation under MicroOS with SELinux enforcing and on physical Raspberry Pi hardware.
 
 ### Migrating the inspected Pi 2 setup
 

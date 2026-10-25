@@ -14,6 +14,7 @@ import urllib.request
 import uuid
 
 ROOT = Path("/var/lib/pihole-appliance")
+RAM_ROOT = Path("/run/pihole/data")
 CONFIG = Path("/etc/pihole-appliance/config.json")
 NAME = "pihole"
 CANARY = "appliance-health.test"
@@ -110,15 +111,31 @@ def dns_probe(tcp=False, domain=CANARY):
 
 
 class Appliance:
-    def __init__(self, config, root=ROOT):
+    def __init__(self, config, root=ROOT, ram_root=RAM_ROOT):
         self.config = config
         self.root = root
+        self.ram_root = ram_root
+        self.ram_data = config.get("pihole", {}).get("ram_data", False)
         root.mkdir(parents=True, exist_ok=True)
         self.state_path = root / "state.json"
         self.state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {"active": None, "previous": None, "pending": None, "failed": {}}
+        self.saved_state = json.dumps(self.state, sort_keys=True) if self.state_path.exists() else None
 
     def save(self):
-        atomic_json(self.state_path, self.state)
+        serialized = json.dumps(self.state, sort_keys=True)
+        if serialized != self.saved_state:
+            atomic_json(self.state_path, self.state)
+            self.saved_state = serialized
+
+    def verify_ram(self):
+        if self.ram_data:
+            mount = command("findmnt", "--mountpoint", "/run/pihole", "--noheadings", "--output", "FSTYPE,OPTIONS")
+            fields = mount.split()
+            if len(fields) != 2 or fields[0] != "tmpfs" or "noswap" not in fields[1].split(","):
+                raise RuntimeError("Pi-hole RAM mode requires a noswap tmpfs at /run/pihole")
+            graph = command("podman", "info", "--format", "{{.Store.GraphRoot}}")
+            if graph != "/run/pihole/containers":
+                raise RuntimeError("Pi-hole RAM mode requires container storage under /run/pihole")
 
     def data(self, generation):
         # State is root-only, but never allow corrupt state to escape this tree.
@@ -126,6 +143,30 @@ class Appliance:
         if not name.startswith("gen-") or "/" in name or ".." in name:
             raise ValueError("Invalid generation path")
         return self.root / name
+
+    def working_data(self, generation):
+        saved = self.data(generation)
+        return self.ram_root / saved.name if self.ram_data else saved
+
+    def prepare_data(self, generation):
+        saved = self.data(generation)
+        working = self.working_data(generation)
+        if self.ram_data:
+            if not working.exists():
+                working.parent.mkdir(parents=True, exist_ok=True)
+                staging = working.parent / (".restore-" + working.name)
+                try:
+                    # The global controller lock makes a leftover staging
+                    # directory evidence of an interrupted restore.
+                    if staging.exists():
+                        shutil.rmtree(staging)
+                    command("cp", "--archive", str(saved), str(staging))
+                    os.replace(staging, working)
+                finally:
+                    if staging.exists():
+                        shutil.rmtree(staging)
+        else:
+            working.mkdir(parents=True, exist_ok=True)
 
     def inspect(self):
         try:
@@ -138,7 +179,7 @@ class Appliance:
     def matches(self, generation):
         info = self.inspect()
         return bool(info and info["State"]["Running"] and info["Image"] == generation["image"]
-                    and any(m.get("Source") == str(self.data(generation)) and m.get("Destination") == "/etc/pihole" for m in info.get("Mounts", [])))
+                    and any(m.get("Source") == str(self.working_data(generation)) and m.get("Destination") == "/etc/pihole" for m in info.get("Mounts", [])))
 
     def stop(self):
         if self.inspect():
@@ -146,8 +187,20 @@ class Appliance:
 
     def start(self, generation):
         command("podman", "rm", "--force", "--ignore", NAME, timeout=90)
-        self.data(generation).mkdir(parents=True, exist_ok=True)
+        self.prepare_data(generation)
         port = str(self.config["pihole"]["web_port"])
+        temporary = []
+        if self.config["pihole"].get("ram_logs", False) or self.ram_data:
+            # Bound logs and temporary files separately from the container
+            # layer. The generation mount below selects RAM or saved data.
+            for path, options in (("/var/log", "size=16m,mode=0755"),
+                                  ("/run", "size=16m,mode=0755"),
+                                  ("/tmp", "size=64m,mode=1777"),
+                                  ("/var/tmp", "size=16m,mode=1777")):
+                noswap = ",noswap" if self.ram_data else ""
+                temporary.extend(("--tmpfs", f"{path}:rw,nosuid,nodev{noswap},{options}"))
+        if self.ram_data:
+            temporary.extend(("--tmpfs", "/dev/shm:rw,nosuid,nodev,noexec,noswap,size=64m,mode=1777"))
         # Keep conmon outside the short-lived controller's service cgroup.
         # Otherwise systemd kills it when a successful oneshot completes.
         command("systemd-run", "--scope", "--quiet", "--collect", "--slice=machine.slice",
@@ -156,8 +209,8 @@ class Appliance:
                 "--restart=always", "--log-driver=journald", "--health-cmd=none",
                 "--env-file", "/etc/pihole-appliance/container.env",
                 "--publish", "53:53/udp", "--publish", "53:53/tcp",
-                "--publish", f"{port}:80/tcp", "--volume", f"{self.data(generation)}:/etc/pihole:Z",
-                generation["image"], timeout=120)
+                "--publish", f"{port}:80/tcp", "--volume", f"{self.working_data(generation)}:/etc/pihole:Z",
+                *temporary, generation["image"], timeout=120)
 
     def healthy(self):
         try:
@@ -216,7 +269,7 @@ class Appliance:
         self.save()
         self.cleanup()
 
-    def deploy(self, image):
+    def deploy(self, image, checkpoint=False):
         old = self.state["active"]
         candidate = {"image": image, "data": "gen-" + uuid.uuid4().hex}
         try:
@@ -224,7 +277,13 @@ class Appliance:
             # mounted in the candidate, so database migrations are reversible.
             self.stop()
             if old:
-                command("cp", "--archive", "--reflink=auto", str(self.data(old)), str(self.data(candidate)))
+                source = self.working_data(old) if checkpoint else self.data(old)
+                command("cp", "--archive", "--reflink=auto", str(source), str(self.data(candidate)))
+                if self.ram_data and self.working_data(old).exists():
+                    # Upgrade the live RAM copy without silently saving UI/list
+                    # changes. The on-card baseline changes only on persist.
+                    self.ram_root.mkdir(parents=True, exist_ok=True)
+                    command("cp", "--archive", str(self.working_data(old)), str(self.working_data(candidate)))
             else:
                 self.data(candidate).mkdir(mode=0o700)
                 self.seed(self.data(candidate))
@@ -244,6 +303,18 @@ class Appliance:
             raise
         self.cleanup()
         print("Committed healthy Pi-hole generation", image, flush=True)
+
+    def persist(self):
+        if not self.ram_data:
+            raise RuntimeError("Explicit persistence requires pihole.ram_data=true")
+        active = self.state["active"]
+        if self.state["pending"] or not active or not self.matches(active) or not self.healthy():
+            raise RuntimeError("Refusing to save: Pi-hole must be healthy with no pending recovery")
+        # deploy stops FTL before copying SQLite and promotes the new snapshot
+        # only after it restarts successfully. A failed copy leaves the old
+        # checkpoint intact and restarts the existing RAM data.
+        self.deploy(active["image"], checkpoint=True)
+        print("Saved Pi-hole RAM data to persistent storage", flush=True)
 
     def seed(self, directory):
         """Seed only a fresh generation; upgrades retain accepted UI changes."""
@@ -306,6 +377,11 @@ class Appliance:
         for path in self.root.glob("gen-*"):
             if path not in paths and path.is_dir() and not path.is_symlink():
                 shutil.rmtree(path)
+        if self.ram_data:
+            ram_paths = {self.working_data(g) for g in retained}
+            for path in self.ram_root.glob("gen-*"):
+                if path not in ram_paths and path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
         # Only remove images this appliance has recorded; never global prune.
         tracked = set(self.state.get("images", [])) | set(self.state["failed"])
         for image in tracked - images:
@@ -319,12 +395,13 @@ class Appliance:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("reconcile", "update", "check", "status"))
+    parser.add_argument("action", choices=("reconcile", "update", "check", "status", "persist"))
     args = parser.parse_args()
     os.umask(0o077)
     with open("/run/pihole-appliance.lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         app = Appliance(json.loads(CONFIG.read_text()))
+        app.verify_ram()
         if args.action == "status":
             print(json.dumps(app.state, indent=2))
         elif args.action == "check":

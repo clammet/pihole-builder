@@ -87,10 +87,64 @@ dns-priority=-100
         "FTLCONF_misc_privacylevel": str(p["privacy_level"]),
         "FTLCONF_webserver_session_timeout": str(p["web_session_timeout"]),
     }
+    if p["database_days"] == 0:
+        # Also isolate ancillary FTL database writes (network/session data).
+        environment.update({"FTLCONF_database_DBimport": "false",
+                            "FTLCONF_database_forceDisk": "false",
+                            "FTLCONF_files_database": "/dev/shm/pihole-FTL.db",
+                            "FTLCONF_webserver_session_restore": "false"})
+    if p["ram_logs"] or p["ram_data"]:
+        environment["TAIL_FTL_LOG"] = "0"
     write(payload, "container.env", "".join(f"{k}={v}\n" for k, v in environment.items()))
     shutil.copyfile(RUNTIME, payload / "appliance.py")
     write(payload, "authorized_keys", "\n".join(config["ssh_authorized_keys"]) + "\n")
+    logging = config["logging"]
+    write(payload, "journald.conf", f"""[Journal]
+Storage={logging['storage']}
+MaxLevelStore={logging['max_level']}
+SystemMaxUse=100M
+RuntimeMaxUse=16M
+ForwardToSyslog=no
+ForwardToKMsg=no
+ForwardToConsole=no
+ForwardToWall=no
+""", 0o644)
     units = payload / "units"
+    if p["ram_data"]:
+        write(payload, "storage.conf", """[storage]
+driver = "overlay"
+graphroot = "/run/pihole/containers"
+runroot = "/run/pihole/runroot"
+imagestore = "/var/lib/containers/storage"
+""", 0o644)
+        write(units, "run-pihole.mount", f"""[Unit]
+Description=Pi-hole working data and container storage in RAM
+
+[Mount]
+What=tmpfs
+Where=/run/pihole
+Type=tmpfs
+Options=mode=0700,size={p['ram_size_mib']}M,noswap
+
+[Install]
+WantedBy=local-fs.target
+""", 0o644)
+        write(units, "pihole-ram.service", """[Unit]
+Description=Prepare SELinux labels for Pi-hole RAM container storage
+Requires=run-pihole.mount
+After=run-pihole.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/mkdir -p /run/pihole/containers
+ExecStart=/usr/sbin/restorecon -RF /run/pihole/containers
+""", 0o644)
+        for name in ("pihole-appliance", "pihole-update"):
+            write(payload, f"ram-dependencies/{name}.service.d/ram.conf", """[Unit]
+Requires=pihole-ram.service
+After=pihole-ram.service
+""", 0o644)
     write(units, "pihole-appliance.service", unit("Pi-hole boot and periodic recovery", "reconcile"), 0o644)
     write(units, "pihole-update.service", unit("Update Pi-hole with data rollback", "update"), 0o644)
     write(units, "pihole-appliance.timer", """[Unit]
@@ -103,6 +157,8 @@ Unit=pihole-appliance.service
 WantedBy=timers.target
 """, 0o644)
     enabled = ["pihole-appliance.service", "pihole-appliance.timer"]
+    if p["ram_data"]:
+        enabled.append("run-pihole.mount")
     u = config["updates"]
     if u["container_calendar"]:
         write(units, "pihole-update.timer", timer("pihole-update", u["container_calendar"], u["random_delay_seconds"]), 0o644)
@@ -134,7 +190,7 @@ configure_network
 if [ "${{1-}}" = --prepare ]; then exit 0; fi
 
 # All target architecture commands execute here, on the Pi's first boot.
-zypper --non-interactive install --no-recommends podman python3 health-checker curl
+zypper --non-interactive install --no-recommends podman python3 health-checker curl{' policycoreutils-python-utils' if p['ram_data'] else ''}
 # transactional-update does not mount persistent subvolumes in its new root.
 # Mount them before writing the archive and health-checker plugin, otherwise
 # those files are hidden by the real subvolume mounts after switch-root.
@@ -179,6 +235,14 @@ printf 'PasswordAuthentication no\\nKbdInteractiveAuthentication no\\nPermitRoot
         script += "install -d -m 700 /root/.ssh\ninstall -m 600 payload/authorized_keys /root/.ssh/authorized_keys\nsystemctl enable sshd.service\n"
     else:
         script += "systemctl disable sshd.service\n"
+    if p["ram_data"]:
+        script += """
+# Images stay on the card; container metadata and writable layers live in RAM.
+mkdir -p /etc/containers /var/lib/containers/storage
+install -m 644 payload/storage.conf /etc/containers/storage.conf
+cp -r payload/ram-dependencies/* /etc/systemd/system/
+semanage fcontext -a -e /var/lib/containers/storage /run/pihole/containers
+"""
     script += f"""
 # NetworkManager assigns this connection to the default firewall zone.
 if command -v firewall-offline-cmd >/dev/null; then
@@ -207,9 +271,16 @@ esac
 PLUGIN
 chmod 755 /usr/local/libexec/health-checker/pihole.sh
 mkdir -p /etc/systemd/journald.conf.d
-printf '[Journal]\\nSystemMaxUse=100M\\nRuntimeMaxUse=32M\\n' > /etc/systemd/journald.conf.d/pihole.conf
+install -m 644 payload/journald.conf /etc/systemd/journald.conf.d/90-pihole.conf
 # Remove bootstrap credentials from the seed after first boot has completed.
 systemctl enable pihole-seed-cleanup.service
+"""
+    if logging["storage"] in ("volatile", "none"):
+        script += """
+# Prevent independent log daemons from bypassing the journal's RAM-only policy.
+systemctl mask rsyslog.service syslog-ng.service syslog.service auditd.service
+mkdir -p /etc/systemd/coredump.conf.d
+printf '[Coredump]\\nStorage=none\\nProcessSizeMax=0\\n' > /etc/systemd/coredump.conf.d/90-pihole.conf
 """
     write(units, "pihole-seed-cleanup.service", """[Unit]
 Description=Remove first-boot credentials and container archive from seed
